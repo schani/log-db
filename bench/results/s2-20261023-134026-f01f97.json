@@ -1,0 +1,102 @@
+{
+  "run_id": "20261023-134026-f01f97",
+  "backend": "s2",
+  "args": {
+    "backend": "s2",
+    "tests": "latency,race",
+    "bucket": null,
+    "region": null,
+    "prefix": "logbench",
+    "basin": "logdb-bench-976641",
+    "stream_prefix": "logbench",
+    "mem_latency_ms": 1.0,
+    "sizes": [
+      256,
+      65536
+    ],
+    "n": 100,
+    "warmup": 20,
+    "tp_size": 65536,
+    "seconds": 60,
+    "parallel": [
+      1,
+      4,
+      16
+    ],
+    "race_writers": 8,
+    "race_rounds": 20,
+    "race_size": 1024,
+    "out": "/Users/schani/Library/Application Support/Claude/scratch-workspaces/f1c75492-3884-4af3-81e2-df2837f7530f/209b35f7-41c8-40dc-9bee-af5d51efe17c/scratch-2026-10-23-66a6c1/bench/results"
+  },
+  "client": {
+    "host": "Emwon-2.local",
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "ec2": null
+  },
+  "started": 1792788026.992843,
+  "latency": {
+    "append_256B": {
+      "count": 100,
+      "mean": 61.716,
+      "min": 59.434,
+      "p50": 61.068,
+      "p90": 62.444,
+      "p99": 90.776,
+      "p999": 90.776,
+      "max": 90.776
+    },
+    "append_65536B": {
+      "count": 100,
+      "mean": 67.466,
+      "min": 64.595,
+      "p50": 67.222,
+      "p90": 69.413,
+      "p99": 81.033,
+      "p999": 81.033,
+      "max": 81.033
+    },
+    "tail_read": {
+      "count": 100,
+      "mean": 31.245,
+      "min": 30.076,
+      "p50": 31.167,
+      "p90": 31.871,
+      "p99": 34.638,
+      "p999": 34.638,
+      "max": 34.638
+    }
+  },
+  "race": {
+    "writers": 8,
+    "rounds": 20,
+    "winners_per_round": {
+      "1": 20
+    },
+    "loser_error_codes": {
+      "412:seq_num_mismatch": 140
+    },
+    "winner_latency_ms": {
+      "count": 20,
+      "mean": 70.999,
+      "min": 43.918,
+      "p50": 65.3,
+      "p90": 95.406,
+      "p99": 180.755,
+      "p999": 180.755,
+      "max": 180.755
+    },
+    "loser_latency_ms": {
+      "count": 140,
+      "mean": 70.73,
+      "min": 43.717,
+      "p50": 64.469,
+      "p90": 91.894,
+      "p99": 182.58,
+      "p999": 182.959,
+      "max": 182.959
+    },
+    "integrity_violations": [],
+    "integrity_violation_count": 0
+  },
+  "finished": 1792788049.198089
+}
