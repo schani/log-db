@@ -64,6 +64,31 @@ Epoch wait (`--epoch-ms`, default 0): with 0, a node sends whatever queued durin
 | S2, 2,000 (2 runs) | 0 | 24,081 / 26,117 txn/s | 77.2 / 73.3 ms | 157 / 145 ms |
 | S2, 2,000 (2 runs) | 5 | 24,700 / 25,800 txn/s | 79.4 / 77.7 ms | 142 / 120 ms |
 
+## Multiple writers
+
+`bench/scripts/writers.sh 15 2000 --log s2 --basin logdb-bench-976641`: 2,000 clients spread over 1–10 writer nodes, 1 replica. Laptop → S2.
+
+| writers | epoch ms | txn/s | p50 ms | p99 ms | max ms | epochs/s | txns/epoch | conflicts/epoch |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0 | 25,637 | 74.9 | 148.5 | 191.5 | 13.1 | 1962 | 0.00 |
+| 1 | 5 | 23,733 | 82.1 | 173.6 | 205.3 | 11.9 | 2000 | 0.00 |
+| 2 | 0 | 10,189 | 181.8 | 743.2 | 1849.6 | 10.3 | 986 | 0.92 |
+| 2 | 5 | 11,733 | 168.3 | 296.6 | 311.5 | 11.7 | 1000 | 0.99 |
+| 4 | 0 | 7,646 | 193.0 | 1148.9 | 1963.1 | 15.5 | 492 | 2.89 |
+| 4 | 5 | 8,100 | 199.3 | 721.2 | 822.1 | 16.2 | 500 | 2.70 |
+| 6 | 0 | 4,363 | 301.9 | 3434.9 | 4658.4 | 13.2 | 331 | 4.72 |
+| 6 | 5 | 5,223 | 232.5 | 2052.7 | 2628.8 | 15.7 | 333 | 4.60 |
+| 8 | 0 | 3,826 | 373.0 | 3537.5 | 3782.9 | 15.9 | 241 | 6.68 |
+| 8 | 5 | 4,000 | 331.9 | 2352.6 | 3438.1 | 16.0 | 250 | 6.47 |
+| 10 | 0 | 3,159 | 371.8 | 5592.9 | 12678.4 | 16.0 | 197 | 8.63 |
+| 10 | 5 | 3,307 | 292.4 | 5702.4 | 9047.6 | 16.5 | 200 | 8.54 |
+
+All runs: every node identical, money conserved. The in-memory log (30 ms) shows the same shape at about twice the rates.
+
+- The log commits a fixed number of epochs per second regardless of writer count. Each writer only batches its own clients, so throughput falls roughly as 1/writers.
+- Each epoch costs about writers − 1 lost races. Unlucky writers lose many in a row: p99 reaches 5.6 s at 10 writers.
+- A 5 ms epoch wait helps with several writers (tighter tails); with one writer, 0 is better.
+
 ## Not yet
 
 - Pipelined appends (S2 append sessions); currently one append in flight per node.
