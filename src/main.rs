@@ -75,8 +75,8 @@ struct LogArgs {
 
 #[derive(Args)]
 struct NodeArgs {
-    /// How long an epoch collects transactions after its first one.
-    #[arg(long, default_value_t = 5)]
+    /// Extra time an epoch waits for transactions; 0 sends whatever queued during the last append.
+    #[arg(long, default_value_t = 0)]
     epoch_ms: u64,
 }
 

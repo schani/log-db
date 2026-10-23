@@ -28,7 +28,7 @@ pub struct NodeConfig {
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        Self { epoch: Duration::from_millis(5), max_batch_bytes: 900 * 1024 }
+        Self { epoch: Duration::ZERO, max_batch_bytes: 900 * 1024 }
     }
 }
 
