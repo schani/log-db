@@ -1,11 +1,12 @@
 # log-db
 
-A prototype database whose only durable state is a shared log with conditional append (currently [S2](https://s2.dev)). No WAL tier, no consensus cluster, no replication protocol.
+A prototype database whose only durable state is a shared log (currently [S2](https://s2.dev)). No WAL tier, no consensus cluster, no replication protocol.
 
 - Transactions are stored procedures (`put`, `delete`, `incr`, `transfer`).
-- A node batches submitted transactions into an epoch and commits it with one conditional append: append only if the log's tail is where the node expects.
-- Every node applies the log in order. Execution is deterministic, so every node reaches the same state. A replica is any node that reads the log.
-- Any number of nodes can write. A node that loses an append race retries at the tail reported by the log, then catches up.
+- A node batches submitted transactions into an epoch and commits it with one append. The log records transaction inputs, not effects.
+- Every node applies the log in order. Execution is deterministic, so every node reaches the same state and computes the same outcomes. A replica is any node that reads the log.
+- Any number of nodes can write. `--append conditional` appends only at the tail the node has applied up to and retries at the reported tail on a lost race; `--append unconditional` lets the log order appends and needs no races.
+- Each batch carries its writer's ID and a batch number. Appends with an unknown outcome are retried; every node skips a batch number it has already applied.
 - Queries run against the node's in-memory state. Passing `min_seq` waits until the node has applied that far (read-your-writes across nodes).
 
 Background and design rationale: [docs/research.md](docs/research.md). Log benchmarks: [bench/](bench/).
@@ -66,28 +67,23 @@ Epoch wait (`--epoch-ms`, default 0): with 0, a node sends whatever queued durin
 
 ## Multiple writers
 
-`bench/scripts/writers.sh 15 2000 --log s2 --basin logdb-bench-976641`: 2,000 clients spread over 1–10 writer nodes, 1 replica. Laptop → S2.
+`bench/scripts/writers.sh 15 2000 --append <mode> --log s2 --basin logdb-bench-976641`: 2,000 clients spread over 1–10 writer nodes, 1 replica, laptop → S2. Full tables, both epoch waits and the in-memory log: [bench/results/writers-s2.md](bench/results/writers-s2.md), [bench/results/writers-mem.md](bench/results/writers-mem.md). Epoch wait 0 below.
 
-| writers | epoch ms | txn/s | p50 ms | p99 ms | max ms | epochs/s | txns/epoch | conflicts/epoch |
+| writers | conditional txn/s | p50 ms | p99 ms | lost races/epoch | unconditional txn/s | p50 ms | p99 ms | epochs/s |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 0 | 25,637 | 74.9 | 148.5 | 191.5 | 13.1 | 1962 | 0.00 |
-| 1 | 5 | 23,733 | 82.1 | 173.6 | 205.3 | 11.9 | 2000 | 0.00 |
-| 2 | 0 | 10,189 | 181.8 | 743.2 | 1849.6 | 10.3 | 986 | 0.92 |
-| 2 | 5 | 11,733 | 168.3 | 296.6 | 311.5 | 11.7 | 1000 | 0.99 |
-| 4 | 0 | 7,646 | 193.0 | 1148.9 | 1963.1 | 15.5 | 492 | 2.89 |
-| 4 | 5 | 8,100 | 199.3 | 721.2 | 822.1 | 16.2 | 500 | 2.70 |
-| 6 | 0 | 4,363 | 301.9 | 3434.9 | 4658.4 | 13.2 | 331 | 4.72 |
-| 6 | 5 | 5,223 | 232.5 | 2052.7 | 2628.8 | 15.7 | 333 | 4.60 |
-| 8 | 0 | 3,826 | 373.0 | 3537.5 | 3782.9 | 15.9 | 241 | 6.68 |
-| 8 | 5 | 4,000 | 331.9 | 2352.6 | 3438.1 | 16.0 | 250 | 6.47 |
-| 10 | 0 | 3,159 | 371.8 | 5592.9 | 12678.4 | 16.0 | 197 | 8.63 |
-| 10 | 5 | 3,307 | 292.4 | 5702.4 | 9047.6 | 16.5 | 200 | 8.54 |
+| 1 | 27,811 | 70.2 | 150.9 | 0 | 26,167 | 68.7 | 340.9 | 13.5 |
+| 2 | 12,121 | 164.3 | 380.4 | 0.97 | 23,379 | 74.2 | 188.5 | 23.6 |
+| 4 | 7,421 | 238.9 | 604.6 | 2.58 | 18,443 | 113.0 | 300.6 | 37.6 |
+| 6 | 5,504 | 255.7 | 1,698.2 | 4.71 | 15,786 | 132.0 | 319.9 | 48.6 |
+| 8 | 4,129 | 312.1 | 2,189.4 | 6.70 | 12,566 | 159.4 | 389.3 | 51.1 |
+| 10 | 3,364 | 413.2 | 3,965.6 | 8.50 | 8,917 | 187.2 | 814.8 | 45.3 |
 
-All runs: every node identical, money conserved. The in-memory log (30 ms) shows the same shape at about twice the rates.
+All 48 runs (S2 and in-memory): every node identical, money conserved. With 10% of in-memory acknowledgements dropped (`--mem-lost-acks 0.1`), retried batches landed twice and every node skipped the same duplicates.
 
-- The log commits a fixed number of epochs per second regardless of writer count. Each writer only batches its own clients, so throughput falls roughly as 1/writers.
-- Each epoch costs about writers − 1 lost races. Unlucky writers lose many in a row: p99 reaches 5.6 s at 10 writers.
-- A 5 ms epoch wait helps with several writers (tighter tails); with one writer, 0 is better.
+- **Conditional:** the log commits a fixed ~15 epochs/s however many nodes write. Each epoch costs about writers − 1 lost races; p99 reaches 4 s at 10 writers.
+- **Unconditional:** no races. Epochs/s grows with writers up to ~50/s, then flattens; on the in-memory log it keeps growing (165/s at 10 writers). The S2 ceiling is unexplained from the laptop: S2 under concurrent appends, the 10 in-process nodes each downloading every epoch, or the laptop link.
+- **Latency floor is two round trips** with several writers: the append, then reading the other writers' records that landed before it. One writer needs only the append.
+- Throughput still falls with writers because each writer batches only its own clients; total clients stay at 2,000.
 
 ## Not yet
 

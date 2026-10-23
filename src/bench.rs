@@ -114,15 +114,19 @@ pub async fn run(make_log: impl AsyncFn() -> anyhow::Result<Arc<dyn Log>>, cfg: 
     let mut ok = true;
     let mut hashes = Vec::new();
     for (role, n) in writers.iter().map(|n| ("writer", n)).chain(replicas.iter().map(|n| ("replica", n))) {
-        let (seq, hash, total) = n.with_state(|s| {
+        let (seq, hash, total, dups) = n.with_state(|s| {
             let total: i64 = s.kv.values().map(|v| if let Value::Int(i) = v { *i } else { 0 }).sum();
-            (s.next_seq, s.hash(), total)
+            (s.next_seq, s.hash(), total, s.duplicates_skipped)
         });
         let expected_total = cfg.accounts as i64 * INITIAL_BALANCE;
         let conserved = total == expected_total;
         ok &= conserved;
         hashes.push((seq, hash));
-        println!("  {role:7} {:016x}: seq {seq} hash {hash:016x} total {total} {}", n.id, if conserved { "ok" } else { "WRONG" });
+        println!(
+            "  {role:7} {:016x}: seq {seq} hash {hash:016x} total {total} {} dups skipped {dups}",
+            n.id,
+            if conserved { "ok" } else { "WRONG" }
+        );
     }
     let same = hashes.windows(2).all(|w| w[0] == w[1]);
     ok &= same;

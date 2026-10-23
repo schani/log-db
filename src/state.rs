@@ -4,7 +4,7 @@
 //! the current state. Every node executes the same log in the same order, so every node
 //! reaches the same state without coordinating.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::Xxh3;
@@ -26,11 +26,21 @@ pub enum Proc {
     Transfer { from: String, to: String, amount: i64 },
 }
 
-/// One epoch: the unit appended to the log.
+/// One epoch: the unit appended to the log, and the unit of retry.
 #[derive(Serialize, Deserialize)]
 pub struct Batch {
     pub writer: u64,
+    /// Increases with each batch a writer sends. A retried batch keeps its number, so a
+    /// copy that lands twice is applied once.
+    pub batch_no: u64,
     pub txns: Vec<Proc>,
+}
+
+/// A batch applied to the state, with the outcome of each of its transactions.
+pub struct Applied {
+    pub writer: u64,
+    pub batch_no: u64,
+    pub outcomes: Vec<Outcome>,
 }
 
 impl Batch {
@@ -56,19 +66,30 @@ pub struct State {
     /// Sequence number of the next log record to apply.
     pub next_seq: u64,
     pub txns_applied: u64,
+    /// Highest batch number applied per writer.
+    last_batch: HashMap<u64, u64>,
+    pub duplicates_skipped: u64,
 }
 
 impl State {
-    /// Applies one log record. Undecodable records are skipped, deterministically.
-    pub fn apply(&mut self, seq: u64, body: &[u8]) -> Vec<Outcome> {
+    /// Applies one log record. Undecodable records and batches a writer already had applied
+    /// are skipped, deterministically.
+    pub fn apply(&mut self, seq: u64, body: &[u8]) -> Option<Applied> {
         assert_eq!(seq, self.next_seq, "records must be applied in order");
         self.next_seq = seq + 1;
         let Some(batch) = Batch::decode(body) else {
             tracing::warn!(seq, "skipping undecodable record");
-            return Vec::new();
+            return None;
         };
+        let last = self.last_batch.entry(batch.writer).or_default();
+        if batch.batch_no <= *last {
+            self.duplicates_skipped += 1;
+            return None;
+        }
+        *last = batch.batch_no;
         self.txns_applied += batch.txns.len() as u64;
-        batch.txns.iter().map(|p| self.execute(p)).collect()
+        let outcomes = batch.txns.iter().map(|p| self.execute(p)).collect();
+        Some(Applied { writer: batch.writer, batch_no: batch.batch_no, outcomes })
     }
 
     fn execute(&mut self, proc: &Proc) -> Outcome {
@@ -139,6 +160,7 @@ mod tests {
     fn batch_roundtrip() {
         let b = Batch {
             writer: 7,
+            batch_no: 1,
             txns: vec![
                 Proc::Put { key: "a".into(), value: Value::Int(5) },
                 Proc::Put { key: "b".into(), value: Value::Text("hi".into()) },
@@ -146,7 +168,7 @@ mod tests {
             ],
         };
         let mut s = State::default();
-        let out = s.apply(0, &b.encode());
+        let out = s.apply(0, &b.encode()).unwrap().outcomes;
         assert_eq!(out, vec![Outcome::Committed; 3]);
         assert_eq!(s.kv["a"], Value::Int(3));
         assert_eq!(s.kv["c"], Value::Int(2));
@@ -155,8 +177,18 @@ mod tests {
 
     #[test]
     fn transfer_aborts_on_insufficient_funds() {
-        let b = Batch { writer: 1, txns: vec![Proc::Transfer { from: "a".into(), to: "b".into(), amount: 1 }] };
+        let b = Batch { writer: 1, batch_no: 1, txns: vec![Proc::Transfer { from: "a".into(), to: "b".into(), amount: 1 }] };
         let mut s = State::default();
-        assert!(matches!(s.apply(0, &b.encode())[0], Outcome::Aborted(_)));
+        assert!(matches!(s.apply(0, &b.encode()).unwrap().outcomes[0], Outcome::Aborted(_)));
+    }
+
+    #[test]
+    fn duplicate_batch_applied_once() {
+        let b = Batch { writer: 1, batch_no: 1, txns: vec![Proc::Incr { key: "n".into(), by: 1 }] };
+        let mut s = State::default();
+        assert!(s.apply(0, &b.encode()).is_some());
+        assert!(s.apply(1, &b.encode()).is_none());
+        assert_eq!(s.kv["n"], Value::Int(1));
+        assert_eq!(s.duplicates_skipped, 1);
     }
 }

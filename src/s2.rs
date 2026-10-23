@@ -25,7 +25,7 @@ struct Position {
 
 #[derive(Deserialize)]
 struct AppendAck {
-    end: Position,
+    start: Position,
 }
 
 #[derive(Deserialize)]
@@ -61,7 +61,7 @@ impl S2Log {
 
 #[async_trait]
 impl Log for S2Log {
-    async fn append_if(&self, expected: u64, body: Bytes) -> Result<u64, AppendError> {
+    async fn append(&self, expected: Option<u64>, body: Bytes) -> Result<u64, AppendError> {
         let req = json!({ "records": [{ "body": B64.encode(&body) }], "match_seq_num": expected });
         let r = self
             .http
@@ -73,7 +73,7 @@ impl Log for S2Log {
         match r.status() {
             StatusCode::OK => {
                 let ack: AppendAck = r.json().await.map_err(|e| AppendError::Other(e.into()))?;
-                Ok(ack.end.seq_num)
+                Ok(ack.start.seq_num)
             }
             StatusCode::PRECONDITION_FAILED => {
                 let v: serde_json::Value = r.json().await.map_err(|e| AppendError::Other(e.into()))?;

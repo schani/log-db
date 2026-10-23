@@ -1,11 +1,12 @@
-//! A database node: batches submitted transactions into epochs, commits each epoch with a
-//! conditional append, and applies the log to its local state.
+//! A database node: batches submitted transactions into epochs, appends each epoch to the
+//! log, and applies the log to its local state.
 //!
-//! Any number of nodes can write to the same log. A node that loses an append race catches
-//! up on the records it missed and retries its batch at the new tail. Nothing else is
-//! coordinated: determinism makes every node's state a pure function of the log.
+//! Any number of nodes can write to the same log. The log only records transaction inputs;
+//! outcomes are computed when a record is applied, so the log's order is the only thing
+//! writers need to agree on. Determinism makes every node's state a pure function of the log.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -24,11 +25,20 @@ pub struct NodeConfig {
     pub epoch: Duration,
     /// Approximate cap on an encoded batch (S2 records are at most 1 MiB).
     pub max_batch_bytes: usize,
+    pub append: AppendMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+pub enum AppendMode {
+    /// Append only at the tail this node has applied up to; on a lost race, retry at the new tail.
+    Conditional,
+    /// Append wherever the log puts it; the acknowledgement says where.
+    Unconditional,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        Self { epoch: Duration::ZERO, max_batch_bytes: 900 * 1024 }
+        Self { epoch: Duration::ZERO, max_batch_bytes: 900 * 1024, append: AppendMode::Conditional }
     }
 }
 
@@ -60,6 +70,9 @@ pub struct Node {
     applier: Mutex<()>,
     applied: watch::Sender<u64>,
     submit: mpsc::UnboundedSender<Pending>,
+    batch_no: AtomicU64,
+    /// Outcomes of this node's batches, by batch number, with the seq they were applied at.
+    own_outcomes: std::sync::Mutex<HashMap<u64, (u64, Vec<Outcome>)>>,
     pub stats: Stats,
 }
 
@@ -74,6 +87,8 @@ impl Node {
             applier: Mutex::new(()),
             applied: watch::Sender::new(0),
             submit,
+            batch_no: AtomicU64::new(0),
+            own_outcomes: Default::default(),
             stats: Stats::default(),
         });
         tokio::spawn(node.clone().write_loop(rx));
@@ -122,9 +137,8 @@ impl Node {
     }
 
     /// Applies `records`, skipping ones already applied. Caller holds `applier`.
-    fn apply(&self, records: &[Record]) -> Vec<Vec<Outcome>> {
+    fn apply(&self, records: &[Record]) {
         let mut state = self.state.write().unwrap();
-        let mut outcomes = Vec::new();
         for r in records {
             if r.seq < state.next_seq {
                 continue;
@@ -132,12 +146,13 @@ impl Node {
             if r.seq > state.next_seq {
                 break;
             }
-            outcomes.push(state.apply(r.seq, &r.body));
+            if let Some(a) = state.apply(r.seq, &r.body).filter(|a| a.writer == self.id) {
+                self.own_outcomes.lock().unwrap().insert(a.batch_no, (r.seq, a.outcomes));
+            }
         }
         let next = state.next_seq;
         drop(state);
         self.applied.send_replace(next);
-        outcomes
     }
 
     /// Applies exactly the records before `tail`. Caller holds `applier`.
@@ -197,40 +212,55 @@ impl Node {
     async fn commit(&self, pending: Vec<Pending>) {
         let (procs, waiters): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
         let n = procs.len() as u64;
-        let body = Bytes::from(Batch { writer: self.id, txns: procs }.encode());
-        let _g = self.applier.lock().await;
-        let mut expected = self.next_seq();
-        loop {
+        let batch_no = self.batch_no.fetch_add(1, Relaxed) + 1;
+        let body = Bytes::from(Batch { writer: self.id, batch_no, txns: procs }.encode());
+        // A conditional append targets the tail we have applied up to, so nothing may be
+        // applied while it is in flight. An unconditional one is ordered by the log alone.
+        let conditional = self.config.append == AppendMode::Conditional;
+        let mut guard = if conditional { Some(self.applier.lock().await) } else { None };
+        let mut expected = conditional.then(|| self.next_seq());
+        let mut errors = 0;
+        let seq = loop {
             let t0 = Instant::now();
-            let result = self.log.append_if(expected, body.clone()).await;
+            let result = self.log.append(expected, body.clone()).await;
             self.stats.append_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
             match result {
-                Ok(_) => {
-                    self.stats.epochs.fetch_add(1, Relaxed);
-                    self.stats.txns.fetch_add(n, Relaxed);
-                    self.stats.bytes.fetch_add(body.len() as u64, Relaxed);
-                    // Outcomes depend on records before ours, which we may not have applied yet.
-                    if let Err(e) = self.catch_up(expected).await {
-                        return fail(waiters, &e);
-                    }
-                    let outcomes = self.apply(&[Record { seq: expected, body }]).pop().unwrap_or_default();
-                    for (w, outcome) in waiters.into_iter().zip(outcomes) {
-                        let _ = w.send(Ok(TxnResult { seq: expected, outcome }));
-                    }
-                    return;
-                }
+                Ok(seq) => break seq,
                 Err(AppendError::Mismatch { tail }) => {
                     // Retry at the reported tail right away; catching up first would cost a
                     // round trip and lose every race against a writer that doesn't need to.
                     self.stats.conflicts.fetch_add(1, Relaxed);
-                    expected = tail;
+                    expected = Some(tail);
                 }
                 Err(AppendError::Other(e)) => {
-                    // The batch may have been appended; if so, it will be applied when read back.
+                    // The batch may have landed. Retrying is safe: a second copy is skipped.
                     self.stats.append_errors.fetch_add(1, Relaxed);
-                    return fail(waiters, &e);
+                    errors += 1;
+                    if errors > 3 {
+                        return fail(waiters, &e);
+                    }
                 }
             }
+        };
+        self.stats.epochs.fetch_add(1, Relaxed);
+        self.stats.txns.fetch_add(n, Relaxed);
+        self.stats.bytes.fetch_add(body.len() as u64, Relaxed);
+
+        let guard = match guard.take() {
+            Some(g) => g,
+            None => self.applier.lock().await,
+        };
+        // Outcomes depend on all records before ours.
+        if let Err(e) = self.catch_up(seq).await {
+            return fail(waiters, &e);
+        }
+        self.apply(&[Record { seq, body }]);
+        drop(guard);
+        let Some((seq, outcomes)) = self.own_outcomes.lock().unwrap().remove(&batch_no) else {
+            return fail(waiters, &anyhow!("batch {batch_no} was not applied"));
+        };
+        for (w, outcome) in waiters.into_iter().zip(outcomes) {
+            let _ = w.send(Ok(TxnResult { seq, outcome }));
         }
     }
 }

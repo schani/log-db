@@ -12,7 +12,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::log::{Log, MemLog};
-use crate::node::{Node, NodeConfig};
+use crate::node::{AppendMode, Node, NodeConfig};
 
 #[derive(Parser)]
 #[command(about = "A deterministic database whose only durable state is a shared log")]
@@ -71,6 +71,9 @@ struct LogArgs {
     /// Simulated round trip of the in-memory log.
     #[arg(long, default_value_t = 30)]
     mem_latency_ms: u64,
+    /// Fraction of successful in-memory appends that report an error anyway.
+    #[arg(long, default_value_t = 0.0)]
+    mem_lost_acks: f64,
 }
 
 #[derive(Args)]
@@ -78,11 +81,13 @@ struct NodeArgs {
     /// Extra time an epoch waits for transactions; 0 sends whatever queued during the last append.
     #[arg(long, default_value_t = 0)]
     epoch_ms: u64,
+    #[arg(long, value_enum, default_value = "conditional")]
+    append: AppendMode,
 }
 
 impl NodeArgs {
     fn config(&self) -> NodeConfig {
-        NodeConfig { epoch: Duration::from_millis(self.epoch_ms), ..NodeConfig::default() }
+        NodeConfig { epoch: Duration::from_millis(self.epoch_ms), append: self.append, ..NodeConfig::default() }
     }
 }
 
@@ -97,7 +102,7 @@ impl LogArgs {
     /// Returns a factory producing one log client per node, all on the same log.
     fn factory(&self) -> impl AsyncFn() -> anyhow::Result<Arc<dyn Log>> {
         let kind = self.log;
-        let mem: Arc<dyn Log> = Arc::new(MemLog::new(Duration::from_millis(self.mem_latency_ms)));
+        let mem: Arc<dyn Log> = Arc::new(MemLog::new(Duration::from_millis(self.mem_latency_ms), self.mem_lost_acks));
         let stream = self.stream_name();
         let basin = self.basin.clone();
         let key = self.s2_key.clone();
